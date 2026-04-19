@@ -3,6 +3,12 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Cached market data downloads
+data/
+
+# Demo output
+demo_weights.png
+
 # C extensions
 *.so
 
