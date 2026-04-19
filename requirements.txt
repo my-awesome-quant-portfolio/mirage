@@ -2,3 +2,6 @@ numpy
 scipy
 pandas
 matplotlib
+scikit-learn
+yfinance
+pandas-datareader
