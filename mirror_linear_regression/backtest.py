@@ -8,6 +8,16 @@ Provides two classes:
         sliding window of `window` observations.  Tracks weights, turnover,
         realised returns, and diversification metrics over time.
 
+        Supports explicit transaction cost modelling via the `cost_bps`
+        parameter (cost in basis points per unit of L1 turnover).  The
+        cost-adjusted return for each period is:
+
+            r_net = r_gross - cost_bps * 1e-4 * L1_turnover
+
+        where L1_turnover = sum_i |w_i_new - w_i_old| is the fraction of
+        portfolio value that changes hands.  Setting cost_bps=0 (default)
+        reproduces the gross-return backtest.
+
     RollingSignalBacktest
         Same rolling-window logic for an AlphaSignalCombiner: predicts
         forward returns from signal matrix X and tracks signal weight
@@ -51,6 +61,8 @@ class BacktestResult:
     weights:          np.ndarray
     dates:            np.ndarray = field(default_factory=lambda: np.array([]))
     realised_returns: np.ndarray = field(default_factory=lambda: np.array([]))
+    net_returns:      np.ndarray = field(default_factory=lambda: np.array([]))
+    cost_drag:        np.ndarray = field(default_factory=lambda: np.array([]))
     enb:              np.ndarray = field(default_factory=lambda: np.array([]))
     hhi:              np.ndarray = field(default_factory=lambda: np.array([]))
     turnover:         np.ndarray = field(default_factory=lambda: np.array([]))
@@ -58,7 +70,7 @@ class BacktestResult:
     mse_per_period:   np.ndarray = field(default_factory=lambda: np.array([]))
 
     def summary(self) -> dict:
-        """Scalar summary statistics."""
+        """Scalar summary statistics (gross and net of transaction costs)."""
         stats = {
             "n_periods":     len(self.enb),
             "mean_enb":      float(np.mean(self.enb))      if len(self.enb)      else np.nan,
@@ -68,11 +80,22 @@ class BacktestResult:
         if len(self.realised_returns):
             r = self.realised_returns
             stats.update({
-                "total_return":     float(np.sum(r)),
-                "mean_return":      float(np.mean(r)),
-                "volatility":       float(np.std(r)),
-                "sharpe":           float(np.mean(r) / (np.std(r) + 1e-12)),
-                "max_drawdown":     float(_max_drawdown(r)),
+                "total_return":  float(np.sum(r)),
+                "mean_return":   float(np.mean(r)),
+                "volatility":    float(np.std(r)),
+                "sharpe":        float(np.mean(r) / (np.std(r) + 1e-12)),
+                "max_drawdown":  float(_max_drawdown(r)),
+            })
+        if len(self.net_returns):
+            rn = self.net_returns
+            stats.update({
+                "net_total_return": float(np.sum(rn)),
+                "net_sharpe":       float(np.mean(rn) / (np.std(rn) + 1e-12)),
+                "net_max_drawdown": float(_max_drawdown(rn)),
+                "mean_cost_drag":   float(np.mean(self.cost_drag))
+                                    if len(self.cost_drag) else np.nan,
+                "total_cost_drag":  float(np.sum(self.cost_drag))
+                                    if len(self.cost_drag) else np.nan,
             })
         if len(self.mse_per_period):
             stats["mean_oos_mse"] = float(np.mean(self.mse_per_period))
@@ -85,9 +108,16 @@ class BacktestResult:
         print(f"  Mean HHI:       {s.get('mean_hhi', float('nan')):.4f}")
         print(f"  Mean turnover:  {s.get('mean_turnover', float('nan')):.4f}")
         if "sharpe" in s:
+            print(f"  --- Gross returns ---")
             print(f"  Total return:   {s['total_return']:.4f}")
             print(f"  Sharpe ratio:   {s['sharpe']:.3f}")
             print(f"  Max drawdown:   {s['max_drawdown']:.4f}")
+        if "net_sharpe" in s:
+            print(f"  --- Net of costs ---")
+            print(f"  Net total ret:  {s['net_total_return']:.4f}")
+            print(f"  Net Sharpe:     {s['net_sharpe']:.3f}")
+            print(f"  Net drawdown:   {s['net_max_drawdown']:.4f}")
+            print(f"  Total cost:     {s['total_cost_drag']:.6f}")
         if "mean_oos_mse" in s:
             print(f"  Mean OOS MSE:   {s['mean_oos_mse']:.6f}")
 
@@ -131,6 +161,7 @@ class RollingPortfolioBacktest:
         optimizer:     str   = "mirror_descent",
         n_iters:       int   = 400,
         learning_rate: float = 0.1,
+        cost_bps:      float = 0.0,
     ):
         self.window        = window
         self.refit_freq    = refit_freq
@@ -138,6 +169,7 @@ class RollingPortfolioBacktest:
         self.optimizer     = optimizer
         self.n_iters       = n_iters
         self.learning_rate = learning_rate
+        self.cost_bps      = cost_bps   # transaction cost in basis points per unit L1 turnover
 
     def run(
         self,
@@ -162,7 +194,7 @@ class RollingPortfolioBacktest:
                 f"Not enough data: T={T} <= window={self.window} + refit_freq={self.refit_freq}"
             )
 
-        weights_list, real_ret_list = [], []
+        weights_list, real_ret_list, net_ret_list, cost_list = [], [], [], []
         enb_list, hhi_list, turn_list = [], [], []
         date_list = []
         prev_w = np.ones(N) / N
@@ -184,11 +216,18 @@ class RollingPortfolioBacktest:
             oos_ret = returns[end:end + self.refit_freq]
             realised = float(np.sum(oos_ret @ w))
 
+            # Transaction cost: cost_bps basis points per unit L1 turnover
+            l1_turn = float(np.sum(np.abs(w - prev_w)))
+            cost = self.cost_bps * 1e-4 * l1_turn
+            net = realised - cost
+
             weights_list.append(w)
             real_ret_list.append(realised)
+            net_ret_list.append(net)
+            cost_list.append(cost)
             enb_list.append(effective_number_of_bets(w))
             hhi_list.append(herfindahl_index(w))
-            turn_list.append(float(np.sum(np.abs(w - prev_w))))
+            turn_list.append(l1_turn)
             if dates is not None:
                 date_list.append(dates[end - 1])
             prev_w = w.copy()
@@ -197,6 +236,8 @@ class RollingPortfolioBacktest:
             weights=np.array(weights_list),
             dates=np.array(date_list) if date_list else np.arange(len(weights_list)),
             realised_returns=np.array(real_ret_list),
+            net_returns=np.array(net_ret_list),
+            cost_drag=np.array(cost_list),
             enb=np.array(enb_list),
             hhi=np.array(hhi_list),
             turnover=np.array(turn_list),
