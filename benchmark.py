@@ -1,7 +1,8 @@
 """
-benchmark.py — MIRAGE++ vs classical linear regression baselines.
+benchmark.py — MIRAGE++ vs classical and Riemannian baselines.
 
-Compares MIRAGE++ (4 optimisers) against OLS, Ridge, Lasso, and ElasticNet
+Compares MIRAGE++ (4 optimisers) against OLS, Ridge, Lasso, ElasticNet,
+Frank-Wolfe on the simplex, and Riemannian SGD (natural gradient projected)
 on six quantitative finance scenarios using k-fold cross-validation.
 
 Metrics reported per model per dataset:
@@ -15,10 +16,23 @@ Metrics reported per model per dataset:
   weight_l1      L1 distance from ground-truth weights (where available)
   time_s         Wall-clock training time (seconds)
 
+Statistical testing:
+  Paired Wilcoxon signed-rank test (across CV folds) between the best
+  MIRAGE++ variant and the best sklearn/geometric baseline per dataset.
+  Reports p-value and significance at alpha=0.05.
+
+Baselines:
+  FrankWolfe     Constrained Frank-Wolfe on simplex — moves weight mass to
+                 the vertex with steepest descent. O(1/T) on smooth objectives,
+                 no learning rate. Does not use Bregman geometry.
+  RiemannianSGD  Natural gradient (Fisher-Rao) + simplex projection, no
+                 entropy regularisation. Equivalent to NGD at lambda=0.
+
 Run:
     python benchmark.py
-    python benchmark.py --dataset alpha     # single dataset
-    python benchmark.py --quick             # fewer folds / iterations
+    python benchmark.py --dataset alpha       # single dataset
+    python benchmark.py --quick               # fewer folds / iterations
+    python benchmark.py --no-significance     # skip Wilcoxon tests
 """
 
 import sys
@@ -27,6 +41,7 @@ import copy
 import warnings
 import argparse
 import numpy as np
+from scipy.stats import wilcoxon
 from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
 from sklearn.model_selection import KFold
 from sklearn.metrics import mean_squared_error, r2_score
@@ -36,8 +51,9 @@ warnings.filterwarnings("ignore", category=UserWarning)
 from mirror_linear_regression import MirrorLinearRegression
 from mirror_linear_regression.bregman import ItakuraSaitoDivergence
 from mirror_linear_regression.utils_math import (
-    entropy, herfindahl_index, effective_number_of_bets,
+    entropy, herfindahl_index, effective_number_of_bets, project_simplex,
 )
+from mirror_linear_regression.geometry import natural_gradient
 from examples.synthetic_datasets import (
     toy_alpha_signal_combination,
     toy_sparse_portfolio,
@@ -78,6 +94,99 @@ def _mirage(optimizer, lam, lr, n_iters, divergence=None):
     )
 
 
+class FrankWolfeSimplex:
+    """
+    Frank-Wolfe (conditional gradient) algorithm on the probability simplex.
+
+    At each step, finds the vertex s* = e_{i*} where i* = argmin_i g_i,
+    then moves toward s*:  theta_{t+1} = (1 - gamma_t) * theta_t + gamma_t * s*
+    with step size gamma_t = 2 / (t + 2)  (open-loop schedule for convex L).
+
+    Convergence: O(L/T) for L-smooth objectives — same rate as Mirror Prox
+    but without a Bregman geometry.  Does not benefit from the log(n) dimension
+    reduction of KL mirror descent (its per-iteration cost is O(mn) but its
+    regret scales as O(sqrt(nT)) like Euclidean methods).
+    """
+
+    def __init__(self, n_iters: int = 600, tol: float = 1e-7):
+        self.n_iters = n_iters
+        self.tol = tol
+        self.weights_: np.ndarray | None = None
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "FrankWolfeSimplex":
+        m, n = X.shape
+        theta = np.ones(n) / n
+        prev_loss = np.inf
+        XtX = X.T @ X / m
+        Xty = X.T @ y / m
+
+        for t in range(1, self.n_iters + 1):
+            grad = 2.0 * (XtX @ theta - Xty)
+            s = np.zeros(n)
+            s[np.argmin(grad)] = 1.0
+            gamma = 2.0 / (t + 2.0)
+            theta = (1.0 - gamma) * theta + gamma * s
+
+            loss = float(np.mean((X @ theta - y) ** 2))
+            if abs(prev_loss - loss) < self.tol:
+                break
+            prev_loss = loss
+
+        self.weights_ = theta
+        return self
+
+    @property
+    def coef_(self) -> np.ndarray:
+        return self.weights_
+
+
+class RiemannianSGD:
+    """
+    Riemannian SGD on the probability simplex using the Fisher-Rao metric.
+
+    Computes the natural gradient  ng_i = theta_i * (g_i - theta^T g)
+    (the Riemannian gradient under the Fisher information metric), takes
+    a projected gradient step, then projects back onto the simplex.
+
+    This is the geometric baseline: correct Riemannian update, but without
+    entropy regularisation (lambda=0).  Isolates the contribution of the
+    Bregman proximal step vs the Riemannian gradient direction.
+    """
+
+    def __init__(self, learning_rate: float = 0.05, n_iters: int = 600,
+                 tol: float = 1e-7):
+        self.learning_rate = learning_rate
+        self.n_iters = n_iters
+        self.tol = tol
+        self.weights_: np.ndarray | None = None
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "RiemannianSGD":
+        m, n = X.shape
+        theta = np.ones(n) / n
+        prev_loss = np.inf
+        XtX = X.T @ X / m
+        Xty = X.T @ y / m
+
+        for _ in range(self.n_iters):
+            grad = 2.0 * (XtX @ theta - Xty)
+            ng = natural_gradient(grad, theta)
+            theta = project_simplex(theta - self.learning_rate * ng)
+            theta = np.clip(theta, 1e-12, None)
+            theta /= theta.sum()
+
+            loss = float(np.mean((X @ theta - y) ** 2))
+            if abs(prev_loss - loss) < self.tol:
+                break
+            prev_loss = loss
+
+        self.weights_ = theta
+        return self
+
+    @property
+    def coef_(self) -> np.ndarray:
+        return self.weights_
+
+
 def build_model_registry(quick: bool = False) -> dict:
     iters = 300 if quick else 600
 
@@ -91,6 +200,9 @@ def build_model_registry(quick: bool = False) -> dict:
         "Lasso(α=0.01)":    ("sklearn", Lasso(alpha=0.01,  fit_intercept=False, max_iter=5000)),
         "ElasticNet":       ("sklearn", ElasticNet(alpha=0.01, l1_ratio=0.5,
                                                    fit_intercept=False, max_iter=5000)),
+        # --- Geometric baselines (constrained, no entropy regularisation) ---
+        "FrankWolfe":       ("sklearn", FrankWolfeSimplex(n_iters=iters)),
+        "RiemannianSGD":    ("sklearn", RiemannianSGD(learning_rate=0.05, n_iters=iters)),
         # --- MIRAGE++ variants ---
         "MIRAGE-MD(λ=0.001)":  ("mirage", _mirage("mirror_descent",   0.001, 0.10, iters)),
         "MIRAGE-MD(λ=0.01)":   ("mirage", _mirage("mirror_descent",   0.01,  0.10, iters)),
@@ -189,6 +301,8 @@ def run_single(model_type, model_obj, X, y, true_weights, n_splits, seed):
         "hhi":            float(np.mean(hhi_list)),
         "enb":            float(np.mean(enb_list)),
         "time_s":         float(np.mean(time_list)),
+        # Per-fold arrays for statistical testing
+        "_fold_mse":      te_mse_list,
     }
     if true_weights is not None:
         out["weight_cosine"] = float(np.mean(cos_list))
@@ -237,6 +351,71 @@ def run_benchmark(datasets=None, models=None, n_splits=5, seed=42, quick=False):
 # ---------------------------------------------------------------------------
 # Pretty printing
 # ---------------------------------------------------------------------------
+
+def run_significance_tests(results: dict) -> dict:
+    """
+    Paired Wilcoxon signed-rank test: best MIRAGE++ vs best non-MIRAGE per dataset.
+
+    Uses per-fold MSE arrays for paired comparison. Returns a dict of
+    {dataset: {stat, pvalue, significant, mirage_model, baseline_model,
+               mirage_mean_mse, baseline_mean_mse, improvement_pct}}
+    """
+    sig_results = {}
+    for ds_name, ds_res in results.items():
+        mirage_models = {k: v for k, v in ds_res.items()
+                         if k.startswith("MIRAGE") and "_fold_mse" in v}
+        baseline_models = {k: v for k, v in ds_res.items()
+                           if not k.startswith("MIRAGE") and "_fold_mse" in v}
+        if not mirage_models or not baseline_models:
+            continue
+
+        # Pick best MIRAGE and best baseline by mean test MSE
+        best_mirage_name = min(mirage_models, key=lambda k: mirage_models[k]["test_mse"])
+        best_baseline_name = min(baseline_models, key=lambda k: baseline_models[k]["test_mse"])
+
+        m_folds = np.array(mirage_models[best_mirage_name]["_fold_mse"])
+        b_folds = np.array(baseline_models[best_baseline_name]["_fold_mse"])
+
+        if len(m_folds) < 5 or np.allclose(m_folds, b_folds):
+            stat, pvalue = np.nan, np.nan
+        else:
+            try:
+                stat, pvalue = wilcoxon(m_folds, b_folds, alternative="less")
+            except Exception:
+                stat, pvalue = np.nan, np.nan
+
+        m_mean = float(np.mean(m_folds))
+        b_mean = float(np.mean(b_folds))
+        improvement = 100.0 * (b_mean - m_mean) / (b_mean + 1e-12)
+
+        sig_results[ds_name] = {
+            "mirage_model":     best_mirage_name,
+            "baseline_model":   best_baseline_name,
+            "mirage_mean_mse":  m_mean,
+            "baseline_mean_mse": b_mean,
+            "improvement_pct":  improvement,
+            "stat":             stat,
+            "pvalue":           pvalue,
+            "significant":      bool(not np.isnan(pvalue) and pvalue < 0.05),
+        }
+    return sig_results
+
+
+def print_significance_report(sig_results: dict) -> None:
+    """Print the Wilcoxon significance test results."""
+    print("\n" + "=" * 80)
+    print("  STATISTICAL SIGNIFICANCE (Wilcoxon signed-rank, paired, one-sided)")
+    print("  H0: MIRAGE++ MSE >= baseline MSE    alpha = 0.05")
+    print("=" * 80)
+    print(f"  {'Dataset':<28} {'MIRAGE vs Baseline':<38} {'Improv%':>7}  {'p-value':>8}  {'Sig?':>5}")
+    print("-" * 80)
+    for ds, r in sig_results.items():
+        vs = f"{r['mirage_model'][:18]} vs {r['baseline_model'][:16]}"
+        sig_marker = "YES *" if r["significant"] else "no"
+        p_str = f"{r['pvalue']:.4f}" if not np.isnan(r["pvalue"]) else "  n/a"
+        print(f"  {ds:<28} {vs:<38} {r['improvement_pct']:>6.1f}%  {p_str:>8}  {sig_marker:>5}")
+    print()
+
 
 def _fmt(val, fmt=".5f"):
     if val is None or (isinstance(val, float) and np.isnan(val)):
@@ -300,7 +479,7 @@ def print_table(results: dict, metric: str = "test_mse", title: str = None):
     print()
 
 
-def print_full_report(results: dict):
+def print_full_report(results: dict, run_sig: bool = True):
     print("\n" + "=" * 80)
     print("  MIRAGE++ BENCHMARK REPORT")
     print("=" * 80)
@@ -324,6 +503,10 @@ def print_full_report(results: dict):
                     "WEIGHT RECOVERY: cosine similarity to true θ  (higher is better)")
         print_table(results, "weight_l1",
                     "WEIGHT RECOVERY: L1 distance from true θ  (lower is better)")
+
+    if run_sig:
+        sig = run_significance_tests(results)
+        print_significance_report(sig)
 
 
 def print_summary_ranking(results: dict):
@@ -360,6 +543,8 @@ if __name__ == "__main__":
     parser.add_argument("--seed",    type=int, default=42)
     parser.add_argument("--quick",   action="store_true",
                         help="Fewer iterations for faster run")
+    parser.add_argument("--no-significance", action="store_true",
+                        help="Skip Wilcoxon significance tests")
     args = parser.parse_args()
 
     print(f"\nMIRAGE++ Benchmark  |  folds={args.folds}  quick={args.quick}")
@@ -373,5 +558,6 @@ if __name__ == "__main__":
         quick=args.quick,
     )
 
-    print_full_report(results)
+    run_sig = not args.no_significance
+    print_full_report(results, run_sig=run_sig)
     print_summary_ranking(results)
