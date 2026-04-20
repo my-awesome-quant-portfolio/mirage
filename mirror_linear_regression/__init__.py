@@ -45,6 +45,9 @@ from .geometry import (
 from .convergence import (
     kl_regret_bound,
     euclidean_regret_bound,
+    minimax_lower_bound,
+    kl_optimality_gap,
+    euclidean_suboptimality_factor,
     optimal_learning_rate,
     convergence_rate_estimate,
     compute_regret,
@@ -73,8 +76,10 @@ __all__ = [
     "spd_riemannian_gradient", "spd_retraction",
     "spd_geodesic", "affine_invariant_distance", "project_to_spd",
     # Convergence
-    "kl_regret_bound", "euclidean_regret_bound", "optimal_learning_rate",
-    "convergence_rate_estimate", "compute_regret", "print_convergence_report",
+    "kl_regret_bound", "euclidean_regret_bound", "minimax_lower_bound",
+    "kl_optimality_gap", "euclidean_suboptimality_factor",
+    "optimal_learning_rate", "convergence_rate_estimate",
+    "compute_regret", "print_convergence_report",
     # Applications
     "PortfolioAllocator", "AlphaSignalCombiner",
     "RollingPortfolioBacktest", "RollingSignalBacktest", "BacktestResult",
